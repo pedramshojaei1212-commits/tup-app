@@ -1,0 +1,62 @@
+name: Build TUP APK
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      SITE: https://sparkling-flan-597ac1.netlify.app
+      APP_ID: app.netlify.sparkling_flan_597ac1.twa
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Get app files
+        run: |
+          mkdir -p app/www app/assets
+          cd app/www
+          for f in index.html manifest.json sw.js icon-192.png icon-512.png; do
+            curl -fsSL "$SITE/$f" -o "$f"
+          done
+          cd ..
+          convert www/icon-512.png -resize 1024x1024 assets/icon-only.png || cp www/icon-512.png assets/icon-only.png
+      - name: Create Android project
+        working-directory: app
+        run: |
+          npm init -y
+          npm i @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          cat > capacitor.config.json <<EOF
+          {"appId":"$APP_ID","appName":"TUP","webDir":"www","backgroundColor":"#070a1a","android":{"allowMixedContent":false}}
+          EOF
+          npx cap add android
+          npx cap sync android
+          sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO"/><uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/><application#' android/app/src/main/AndroidManifest.xml
+          sed -i "s/versionCode 1/versionCode $((100 + GITHUB_RUN_NUMBER))/" android/app/build.gradle
+          npm i -D @capacitor/assets@3
+          npx capacitor-assets generate --android --iconBackgroundColor '#070a1a' --iconBackgroundColorDark '#070a1a' || echo "icon step skipped"
+      - name: Build APK
+        working-directory: app/android
+        run: ./gradlew assembleRelease --no-daemon
+      - name: Sign APK
+        working-directory: app/android
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASS }}
+        run: |
+          echo "$KS_B64" | base64 -d > tup.p12
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/zipalign -p 4 app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+          $BT/apksigner sign --ks tup.p12 --ks-type pkcs12 --ks-key-alias tup --ks-pass env:KS_PASS --out TUP.apk aligned.apk
+          $BT/apksigner verify --print-certs TUP.apk
+          rm tup.p12
+      - name: Publish release
+        working-directory: app/android
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${GITHUB_RUN_NUMBER}" TUP.apk --repo "$GITHUB_REPOSITORY" --title "TUP build ${GITHUB_RUN_NUMBER}" --notes "Signed Android app" --latest
